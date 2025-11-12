@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
 	"time"
 
@@ -17,9 +18,17 @@ type RedisQueue struct {
 }
 
 func NewRedisQueue() *RedisQueue {
+	addr := os.Getenv("REDIS_ADDR")
+	if addr == "" {
+		addr = "localhost:6379" // fallback for local dev
+	}
+
+	fmt.Println("🔌 Connecting to Redis at:", addr)
+
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "localhost:6379",
+		Addr: addr,
 	})
+
 	return &RedisQueue{
 		client: rdb,
 		ctx:    context.Background(),
