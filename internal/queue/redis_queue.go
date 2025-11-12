@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/devang/go-task-queue/internal/metrics"
@@ -18,17 +19,41 @@ type RedisQueue struct {
 }
 
 func NewRedisQueue() *RedisQueue {
-	addr := os.Getenv("REDIS_ADDR")
-	if addr == "" {
-		addr = "localhost:6379" // fallback for local dev
+	rawURL := os.Getenv("REDIS_ADDR")
+	if rawURL == "" {
+		rawURL = "redis://localhost:6379" // fallback for local dev
 	}
 
-	fmt.Println("🔌 Connecting to Redis at:", addr)
+	fmt.Println("🔌 Connecting to Redis at:", rawURL)
+
+	// Remove redis:// or rediss:// prefix
+	trimmed := strings.TrimPrefix(rawURL, "redis://")
+	trimmed = strings.TrimPrefix(trimmed, "rediss://")
+
+	// Extract password and address
+	var password, addr string
+	if strings.Contains(trimmed, "@") {
+		parts := strings.SplitN(trimmed, "@", 2)
+		userInfo := parts[0]
+		addr = parts[1]
+
+		if strings.Contains(userInfo, ":") {
+			p := strings.SplitN(userInfo, ":", 2)
+			if len(p) == 2 {
+				password = p[1]
+			}
+		}
+	} else {
+		addr = trimmed
+	}
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr: addr,
+		Addr:     addr,     // e.g. red-xxxxxx:6379
+		Password: password, // extract from redis:// URL if available
+		DB:       0,
 	})
 
+	fmt.Println("✅ Redis client initialized with:", addr)
 	return &RedisQueue{
 		client: rdb,
 		ctx:    context.Background(),
