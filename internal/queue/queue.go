@@ -3,6 +3,7 @@ package queue
 import (
 	"fmt"
 	"math/rand"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,6 +25,7 @@ type Queue struct {
 	counter       int64
 	totalDuration float64
 	totalJobs     int
+	wg            sync.WaitGroup
 }
 
 func NewQueue(bufferCapacity int) *Queue {
@@ -44,7 +46,6 @@ func (q *Queue) Enqueue(name string) Job {
 
 func (q *Queue) StartWorkerWithRedis(workerID int, rq *RedisQueue) {
 	go func() {
-
 		for {
 			job, err := rq.Dequeue()
 			if err != nil {
@@ -52,40 +53,47 @@ func (q *Queue) StartWorkerWithRedis(workerID int, rq *RedisQueue) {
 				continue
 			}
 
-			job.Status = "PROCESSING"
-			job.StartedAt = time.Now()
-			rq.SetJobStatus(job.ID, "PROCESSING")
-			rq.SaveJob(job)
+			// Track job for graceful shutdown
+			q.wg.Add(1)
+			go func(job Job) {
+				defer q.wg.Done()
 
-			fmt.Printf("👷 Worker %d started job #%d (%s)\n", workerID, job.ID, job.Name)
+				job.Status = "PROCESSING"
+				job.StartedAt = time.Now()
+				rq.SetJobStatus(job.ID, "PROCESSING")
+				rq.SaveJob(job)
 
-			success := q.processJobWithTimeout(workerID, job, 3*time.Second)
+				fmt.Printf("👷 Worker %d started job #%d (%s)\n", workerID, job.ID, job.Name)
 
-			if success {
-				job.Status = "SUCCESS"
-				job.EndedAt = time.Now()
-				rq.SetJobStatus(job.ID, "SUCCESS")
-				rq.SaveJob(job)
-				metrics.JobsCompleted.Inc()
-			} else if job.Retries < job.MaxRetry {
-				job.Retries++
-				backoff := time.Duration(5*(1<<job.Retries)) * time.Second // Exponential backoff
-				rq.EnqueueWithDelay(job, backoff)
-				job.Status = "RETRYING"
-				rq.SetJobStatus(job.ID, "RETRYING")
-				rq.SaveJob(job)
-				fmt.Printf("🔁 Retrying job #%d (retry %d) after %.0f seconds\n", job.ID, job.Retries, backoff.Seconds())
-			} else {
-				job.Status = "FAILED"
-				job.EndedAt = time.Now()
-				rq.MoveToDLQ(job)
-				rq.SetJobStatus(job.ID, "FAILED")
-				rq.SaveJob(job)
-				metrics.JobsFailed.Inc()
-			}
+				success := q.processJobWithTimeout(workerID, job, 3*time.Second)
+
+				if success {
+					job.Status = "SUCCESS"
+					job.EndedAt = time.Now()
+					rq.SetJobStatus(job.ID, "SUCCESS")
+					rq.SaveJob(job)
+					metrics.JobsCompleted.Inc()
+				} else if job.Retries < job.MaxRetry {
+					job.Retries++
+					backoff := time.Duration(5*(1<<job.Retries)) * time.Second // Exponential backoff
+					rq.EnqueueWithDelay(job, backoff)
+					job.Status = "RETRYING"
+					rq.SetJobStatus(job.ID, "RETRYING")
+					rq.SaveJob(job)
+					fmt.Printf("🔁 Retrying job #%d (retry %d) after %.0f seconds\n", job.ID, job.Retries, backoff.Seconds())
+				} else {
+					job.Status = "FAILED"
+					job.EndedAt = time.Now()
+					rq.MoveToDLQ(job)
+					rq.SetJobStatus(job.ID, "FAILED")
+					rq.SaveJob(job)
+					metrics.JobsFailed.Inc()
+				}
+			}(job)
 		}
 	}()
 }
+
 
 func (q *Queue) processJobWithTimeout(workerID int, job Job, timeout time.Duration) bool {
 	start := time.Now() // start timer
@@ -134,4 +142,10 @@ func (q *Queue) processJobWithTimeout(workerID int, job Job, timeout time.Durati
 		fmt.Printf("⏰ Worker %d timeout on job #%d after %.2f sec\n", workerID, job.ID, duration)
 		return false
 	}
+}
+
+func (q *Queue) WaitForOngoingJobs() {
+	fmt.Println("🕒 Waiting for all workers to finish current jobs...")
+	q.wg.Wait() // q.wg is your worker WaitGroup
+	fmt.Println("✅ All workers completed their jobs.")
 }

@@ -35,6 +35,21 @@ func NewRedisQueue() *RedisQueue {
 	}
 }
 
+func (rq *RedisQueue) EnqueueWithDelay(job Job, delay time.Duration) error {
+	jobData, err := json.Marshal(job)
+	if err != nil {
+		return err
+	}
+
+	execTime := time.Now().Add(delay).Unix()
+
+	// Add job to a sorted set with its execution timestamp as the score
+	return rq.client.ZAdd(rq.ctx, "delayed_jobs", redis.Z{
+		Score:  float64(execTime),
+		Member: jobData,
+	}).Err()
+}
+
 func (rq *RedisQueue) Enqueue(job Job) error {
 	data, err := json.Marshal(job)
 	if err != nil {
@@ -69,15 +84,30 @@ func (rq *RedisQueue) MoveToDLQ(job Job) {
 	metrics.DLQSize.Set(float64(size))
 }
 
-func (rq *RedisQueue) EnqueueWithDelay(job Job, delay time.Duration) {
+func (rq *RedisQueue) StartDelayedJobPoller() {
 	go func() {
-		time.Sleep(delay)
-		rq.Enqueue(job)
+		for {
+			now := float64(time.Now().Unix())
 
-		depth, _ := rq.client.LLen(rq.ctx, "job_queue").Result()
-		metrics.QueueDepth.Set(float64(depth))
+			// Get all jobs whose score (execution time) <= current time
+			jobs, err := rq.client.ZRangeByScore(rq.ctx, "delayed_jobs", &redis.ZRangeBy{
+				Min: "0",
+				Max: fmt.Sprintf("%f", now),
+			}).Result()
 
-		fmt.Printf("⏱️ Job #%d requeued after %.0f sec delay\n", job.ID, delay.Seconds())
+			if err != nil {
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			for _, jobData := range jobs {
+				// Move job from delayed_jobs to main queue
+				rq.client.LPush(rq.ctx, "job_queue", jobData)
+				rq.client.ZRem(rq.ctx, "delayed_jobs", jobData)
+			}
+
+			time.Sleep(1 * time.Second) // check every second
+		}
 	}()
 }
 

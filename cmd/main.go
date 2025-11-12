@@ -1,11 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
+	"time"
 
 	httpui "github.com/devang/go-task-queue/internal/http"
 	"github.com/devang/go-task-queue/internal/metrics"
@@ -16,6 +21,7 @@ import (
 func main() {
 	q := queue.NewQueue(10)
 	redisQueue := queue.NewRedisQueue()
+	redisQueue.StartDelayedJobPoller()
 
 	for i := 1; i <= 3; i++ {
 		q.StartWorkerWithRedis(i, redisQueue)
@@ -25,10 +31,12 @@ func main() {
 
 	mux := http.NewServeMux()
 	httpui.RegisterAdminRoutes(mux, redisQueue)
-	httpui.RegisterAdminActions(mux,redisQueue)
+	httpui.RegisterAdminActions(mux, redisQueue)
 
+	// Expose Prometheus metrics
 	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 
+	// Enqueue new jobs
 	mux.HandleFunc("/enqueue", func(w http.ResponseWriter, r *http.Request) {
 		name := r.URL.Query().Get("name")
 		if name == "" {
@@ -38,9 +46,9 @@ func main() {
 		redisQueue.Enqueue(job)
 		redisQueue.SetJobStatus(job.ID, "QUEUED")
 		fmt.Fprintf(w, "Job %d enqueued successfully\n", job.ID)
-		w.Write([]byte("Job added to queue\n"))
 	})
 
+	// Get job status
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
 		idStr := r.URL.Query().Get("id")
 		if idStr == "" {
@@ -60,6 +68,7 @@ func main() {
 		fmt.Fprintf(w, "Job %d status: %s\n", jobID, status)
 	})
 
+	// Job history
 	mux.HandleFunc("/history", func(w http.ResponseWriter, r *http.Request) {
 		ids, err := redisQueue.Client().LRange(redisQueue.Ctx(), "job_history", 0, 20).Result()
 		if err != nil {
@@ -74,6 +83,7 @@ func main() {
 		}
 	})
 
+	// Dead Letter Queue (failed jobs)
 	mux.HandleFunc("/dlq", func(w http.ResponseWriter, r *http.Request) {
 		jobs, _ := redisQueue.Client().LRange(redisQueue.Ctx(), "dead_letter_queue", 0, 20).Result()
 
@@ -85,7 +95,38 @@ func main() {
 		}
 	})
 
-	fmt.Println("Server started on :8080")
-	log.Fatal(http.ListenAndServe(":8080", mux))
+	// Create an HTTP server
+	server := &http.Server{
+		Addr:    ":8080",
+		Handler: mux,
+	}
 
+	// Handle system signals for graceful shutdown
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	// Run the server in a separate goroutine
+	go func() {
+		fmt.Println("🚀 Server started on :8080")
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Server error: %v\n", err)
+		}
+	}()
+
+	// Wait for a shutdown signal
+	<-stop
+	fmt.Println("\n🧘 Gracefully shutting down server...")
+
+	// Gracefully shut down HTTP server with a 10-second timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		log.Fatalf("⚠️  Server forced to shutdown: %v", err)
+	}
+
+	// Wait for all workers to finish ongoing jobs
+	q.WaitForOngoingJobs()
+
+	fmt.Println("✅ Server exited cleanly.")
 }

@@ -1,22 +1,21 @@
-# Go Distributed Task Queue (Golang + Redis)
+# Go Task Queue (Go + Redis)
 
-A production‑style task queue built in Go with Redis, worker pool, retries with exponential backoff, a Dead‑Letter Queue (DLQ), Prometheus metrics, Grafana dashboards, and a minimal Admin UI.
+Production-style background job queue written in Go. Jobs are stored in Redis, processed by a worker pool with timeouts, retried with exponential backoff, and tracked with Prometheus/Grafana. A small Admin UI provides visibility into recent jobs and DLQ management.
 
-> **Why this project?**
-> Demonstrates practical distributed‑systems skills: durability, concurrency, observability, fault‑tolerance, and operability.
+> **Purpose**
+> Show how to build an end-to-end queueing system in Go: enqueue API → Redis persistence → worker execution → retries/DLQ → monitoring/operations.
 
 ---
 
 ## ✨ Features
 
-* **Redis‑backed queue** (LPUSH/BRPOP) – works across processes/hosts
-* **Worker pool** with per‑job timeout
-* **Retries** with **exponential backoff**
-* **Dead‑Letter Queue (DLQ)** for permanently failing jobs
-* **Job status & history** in Redis (quick lookups + debugging)
-* **Prometheus metrics** at `/metrics`
-* **Grafana dashboard** (custom panels for queue health)
-* **Admin UI** (read‑only list + DLQ actions: retry/delete)
+* **Redis-backed queue** – jobs live in Redis lists, so multiple replicas can share the same queue
+* **Delayed job support** – failed jobs go into a Redis sorted set and are re-enqueued after backoff
+* **Worker pool with timeouts** – each worker runs jobs with a configurable timeout and graceful shutdown
+* **Retries with exponential backoff** – retries grow as `5s * 2^attempt` until the job lands in the DLQ
+* **Dead-letter queue + Admin UI** – monitor, retry, or delete permanently failing jobs in the browser
+* **Prometheus metrics** – `/metrics` exports queue depth, DLQ size, throughput, and latency data points
+* **Grafana dashboards** – optional Docker Compose stack with Prometheus + Grafana for visual monitoring
 
 ---
 
@@ -26,17 +25,20 @@ A production‑style task queue built in Go with Redis, worker pool, retries wit
 flowchart LR
     C[Client / Producer] -->|HTTP /enqueue| API[Go HTTP API]
     subgraph App[Go Service]
-      API -->|LPUSH job JSON| RQ[(Redis List: job_queue)]
+      API -->|LPUSH job JSON| RQ[(Redis list: job_queue)]
+      RQ -->|LPUSH after delay| Delay[(Redis ZSET: delayed_jobs)]
       W1[Worker 1]
       W2[Worker 2]
       W3[Worker N]
+      Delay -->|poller moves due jobs| RQ
       W1 & W2 & W3 -->|BRPOP job_queue| RQ
-      W1 & W2 & W3 -->|Process + timeout + retry| Logic[Retry & Backoff]
-      Logic -->|on fail & retries left| RQ
-      Logic -->|on final fail| DLQ[(Redis List: dead_letter_queue)]
-      API --> Status[(Redis: job_status:<id>)]
-      API --> JH[(Redis: job:<id> & job_history)]
-      Admin[Admin UI /admin] --> API
+      W1 & W2 & W3 -->|timeout + retry logic| Logic[Retry Controller]
+      Logic -->|retry scheduled| Delay
+      Logic -->|final fail| DLQ[(Redis list: dead_letter_queue)]
+      API --> Status[(Redis string: job_status:<id>)]
+      API --> Meta[(Redis hash: job:<id>)]
+      API --> History[(Redis list: job_history)]
+      Admin[Admin UI] --> API
       Metrics[/Prometheus /metrics/] --> API
     end
     Prom[Prometheus] -->|scrape /metrics| Metrics
@@ -48,66 +50,78 @@ flowchart LR
 * `job_queue` – main FIFO/LIFO list (LPUSH + BRPOP)
 * `dead_letter_queue` – permanently failed jobs
 * `job_status:<id>` – string status (`QUEUED/PROCESSING/RETRYING/SUCCESS/FAILED`)
-* `job:<id>` – hash for job metadata; `job_history` – list of finished job IDs
+* `job:<id>` – hash for job metadata (`started_at`, `ended_at`, retries)
+* `job_history` – list of finished job IDs
+* `delayed_jobs` – sorted set for retry scheduling (score is next execution timestamp)
 
 ---
 
-## 📦 Project Layout (suggested)
+## 📦 Project Layout
 
 ```
 .
 ├── cmd/
-│   └── main.go                # HTTP server, route wiring
+│   └── main.go             # HTTP API, worker bootstrap, graceful shutdown
 ├── internal/
-│   ├── queue/
-│   │   ├── queue.go           # job model, in‑mem queue, worker pool
-│   │   └── redis_queue.go     # Redis client, enqueue/dequeue, DLQ
+│   ├── http/
+│   │   └── admin.go        # Admin UI template + handlers (list, retry, delete)
 │   ├── metrics/
-│   │   └── metrics.go         # Prometheus registry & metrics
-│   └── http/
-│       └── admin.go           # Admin UI routes & template
+│   │   └── metrics.go      # Prometheus registry and custom collectors
+│   └── queue/
+│       ├── queue.go        # Job model, worker loop, retry/backoff logic
+│       └── redis_queue.go  # Redis persistence, delayed queue poller, status utils
 ├── monitoring/
-│   ├── docker-compose.yml     # Prometheus + Grafana stack
-│   └── prometheus.yml         # Prometheus scrape config
+│   ├── grafana-data/       # Persisted Grafana state (mounted via Docker)
+│   └── prometheus.yml      # Prometheus scrape config for the Go service
+├── docker-compose.yml      # App + Redis + Prometheus + Grafana for local demo
+├── Dockerfile              # Minimal container image for the Go service
+├── go.mod / go.sum
 └── README.md
 ```
 
 ---
 
-## 🚀 Quick Start (local)
+## 🚀 Quick Start
 
-### 1) Start Redis
-
-```bash
-# Mac (brew)
-brew install redis && redis-server
-# Linux
-docker run -p 6379:6379 redis:7-alpine
-```
-
-### 2) Run Go service
+### Option A – run everything with Docker Compose
 
 ```bash
-go run ./cmd/main.go
+docker compose up --build
 ```
 
-### 3) Enqueue a few jobs
+What you get:
 
-```bash
-curl "http://localhost:8080/enqueue?name=VideoEncode"
-curl "http://localhost:8080/enqueue?name=EmailSend"
-```
+- Go service on `http://localhost:8080`
+- Redis at `localhost:6379`
+- Prometheus at `http://localhost:9090`
+- Grafana at `http://localhost:3000` (credentials: `admin` / `admin`)
 
-### 4) Check status / history
+### Option B – run Go locally
 
-```bash
-curl "http://localhost:8080/status?id=1"
-curl "http://localhost:8080/history"
-```
-
-### 5) Admin UI
-
-Open: `http://localhost:8080/admin`
+1. Start Redis  
+   ```bash
+   # macOS
+   brew install redis
+   redis-server
+   # Linux / Windows (WSL) quick option
+   docker run --rm -p 6379:6379 redis:7-alpine
+   ```
+2. Run the service  
+   ```bash
+   go run ./cmd/main.go
+   ```
+3. Create some jobs  
+   ```bash
+   curl "http://localhost:8080/enqueue?name=VideoEncode"
+   curl "http://localhost:8080/enqueue?name=EmailSend"
+   ```
+4. Inspect state  
+   ```bash
+   curl "http://localhost:8080/status?id=1"
+   curl "http://localhost:8080/history"
+   curl "http://localhost:8080/dlq"
+   ```
+5. Open the Admin UI – `http://localhost:8080/admin`
 
 ---
 
@@ -115,7 +129,7 @@ Open: `http://localhost:8080/admin`
 
 ### Prometheus endpoint
 
-* Exposed at: `http://localhost:8080/metrics`
+* Available at: `http://localhost:8080/metrics`
 * **Custom metrics**
 
   * `taskqueue_jobs_enqueued_total` (counter)
@@ -143,90 +157,60 @@ increase(taskqueue_jobs_failed_total[5m])
 
 ### Run Prometheus + Grafana via Docker Compose
 
-From `monitoring/`:
-
-```bash
-docker compose up -d
-```
-
-* Prometheus: [http://localhost:9090](http://localhost:9090)
-* Grafana: [http://localhost:3000](http://localhost:3000) (admin / admin)
-* In Grafana → **Connections → Data Sources** → add Prometheus with URL `http://prometheus:9090`.
-* Create panels using the metrics above (e.g., *Jobs Enqueued*, *Jobs Completed*, *Queue Depth*, *Job Processing Time (Latest/Avg)*).
-
-> If your Go service runs on host, use `host.docker.internal:8080` (Mac/Win) or `172.17.0.1:8080` (Linux) as Prometheus target in `prometheus.yml`.
+* `docker compose up --build` already launches Prometheus and Grafana using `monitoring/prometheus.yml`.
+* Prometheus scrapes `http://app:8080/metrics` inside the Compose network. If you run the Go service outside Docker, update the scrape target to `host.docker.internal:8080` (Mac/Win) or `172.17.0.1:8080` (Linux).
+* Grafana persists state in `monitoring/grafana-data`. Import or build dashboards using the PromQL queries above (jobs throughput, queue depth, retry latency, DLQ size).
 
 ---
 
-## ⚙️ Behavior & Key Design Choices
+## ⚙️ Behavior & Design Notes
 
-### Worker execution and timeouts
-
-* Each job runs with a timeout; long jobs are marked failed and retried or sent to DLQ.
-
-### Retries with exponential backoff
-
-* On failure: delay grows like `base * 2^retries` to avoid retry storms.
-
-### Dead‑Letter Queue (DLQ)
-
-* When retries exceed `MaxRetry`, job is pushed to `dead_letter_queue`.
-* Admin UI exposes **Retry** (resets retries to 0) and **Delete** actions.
-
-### Status & history
-
-* Fast lookups via `job_status:<id>` strings.
-* Metadata persisted in `job:<id>` hash; finished IDs appended to `job_history`.
+* **Worker execution & timeouts** – workers simulate variable processing time and enforce a 3s timeout. Timeouts count as failures and go through retry handling.
+* **Retry / backoff** – retries increment `job.Retries` and enqueue the job into `delayed_jobs` with `5s * 2^retries` delay.
+* **Delayed job poller** – a goroutine wakes every second, moves due jobs from `delayed_jobs` back to `job_queue`, and updates queue depth metrics.
+* **Dead-letter queue** – after `MaxRetry` attempts (default 3), the job is shoved into `dead_letter_queue` and shows up in the Admin UI. Retry resets the counter; delete removes it permanently.
+* **Status & history tracking** – lightweight Redis keys (`job_status:<id>`, `job:<id>`, `job_history`) make it easy to inspect job state from HTTP handlers or Redis CLI.
+* **Graceful shutdown** – `main.go` listens for SIGINT/SIGTERM, drains the HTTP server, waits on the worker `WaitGroup`, and exits cleanly.
 
 ---
 
-## 🔧 Configuration (env vars you can add)
+## 🔧 Configuration
 
-* `REDIS_ADDR` (default `localhost:6379`)
-* `WORKER_COUNT` (default `3`)
-* `JOB_TIMEOUT_SECONDS` (default `3`)
-* `MAX_RETRY` (default `3`)
-* `BACKOFF_BASE_SECONDS` (default `5`)
-
-*(In code, read via `os.Getenv` with sensible fallbacks.)*
+* `REDIS_ADDR` – override Redis connection string (defaults to `localhost:6379`). Used by the service and the Docker Compose file.
+* **Ports** – HTTP server listens on `:8080`, Prometheus uses `:9090`, Grafana uses `:3000`. Override via Docker Compose if needed.
 
 ---
 
-## 🛠 API Endpoints
+## 🛠 API Surface
 
-* `POST /enqueue?name=...` → create a job
-* `GET  /status?id=<id>` → job status
-* `GET  /history` → recent finished jobs
-* `GET  /admin` → admin dashboard (HTML)
-* `POST /dlq/retry?id=<id>` → move job from DLQ to queue
-* `POST /dlq/delete?id=<id>` → remove job from DLQ
-* `GET  /metrics` → Prometheus metrics
+* `POST /enqueue?name=...` – create a job (defaults to `"Generic Job"` if name missing)
+* `GET  /status?id=<id>` – text status response for a single job
+* `GET  /history` – list of recent job IDs + statuses
+* `GET  /dlq` – inspect raw DLQ contents from the terminal
+* `GET  /admin` – Bootstrap-powered Admin UI (recent jobs + DLQ with retry/delete actions)
+* `GET  /metrics` – Prometheus metrics endpoint
 
 ---
 
 ## 🧪 How To Demo (script)
 
-1. Enqueue 5–10 jobs (some will randomly fail):
-
+1. Enqueue a bunch of jobs (some fail randomly):
    ```bash
    for i in {1..10}; do curl -s "http://localhost:8080/enqueue?name=Demo-$i"; done
    ```
-2. Open `/admin` → see **Recent Jobs** and **DLQ** filling up.
-3. In Grafana, watch panels:
-
-   * *Jobs Enqueued/Completed*
-   * *Queue Depth*
-   * *Job Processing Time (Latest/Avg)*
-4. Click **Retry** on some DLQ jobs → watch them re‑enter the queue.
+2. Open `/admin` to watch jobs move from queued → processing → success/failure.
+3. Explore the `/metrics` endpoint via Prometheus or curl; build Grafana panels for throughput, duration, queue depth.
+4. Trigger retries from the Admin UI (`Retry` button) and confirm jobs re-enter processing.
+5. Shut down with `Ctrl+C` and observe the graceful shutdown logs.
 
 ---
 
 ## 🧠 Scaling & Operations
 
-* **Horizontal scaling**: run more replicas of the Go service; all share Redis.
-* **Autoscaling signal**: sustained `taskqueue_queue_depth` > threshold.
-* **Graceful shutdown**: drain workers before stopping (add signal handling).
-* **Observability**: alert on rising failures, growing DLQ, high p99 latency.
+* Scale the Go service horizontally; workers across replicas compete on the same Redis lists.
+* Alert on sustained high `taskqueue_queue_depth` or `taskqueue_dlq_size`.
+* Capture p95/p99 latency with Prometheus histograms if moving beyond the demo workload.
+* Wrap the `/enqueue` handler with auth/rate-limiting before exposing externally.
 
 ---
 
@@ -244,17 +228,17 @@ Embed them here once captured:
 
 ---
 
-## 🗺 Roadmap / Nice‑to‑haves
+## 🗺 Roadmap / Nice-to-haves
 
-* Per‑job‑type handlers (plugin registry)
-* Priority queues (separate Redis lists)
-* Scheduled jobs (delayed delivery bucket)
-* Graceful shutdown & in‑flight job requeue
-* Persistent job results storage
-* Auth for Admin UI
+* Per-job-type handler registry (map job names → functions)
+* Priority queues (multiple Redis lists with precedence)
+* Scheduled jobs API (client-specified ETA rather than retries only)
+* Persisted job payloads/results in a datastore
+* Authentication/authorization on Admin UI routes
+* Health checks and readiness probes for container deployments
 
 ---
 
 ## 🙌 Credits
 
-Built by Devang to demonstrate Go concurrency, Redis, and production observability practices.
+Built by Devang to demonstrate Go concurrency, Redis-backed queues, and production-grade observability patterns.
