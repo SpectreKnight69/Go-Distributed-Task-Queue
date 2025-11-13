@@ -225,6 +225,11 @@ Embed them here once captured:
 ![Grafana](docs/grafana-dashboard.png)
 ![Admin UI](docs/admin-ui.png)
 ```
+---
+
+## Deploy Link
+
+https://go-distributed-task-queue.onrender.com/admin
 
 ---
 
