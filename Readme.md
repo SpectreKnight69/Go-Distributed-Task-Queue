@@ -1,4 +1,4 @@
-# Go Task Queue (Go + Redis)
+<img width="1440" height="819" alt="image" src="https://github.com/user-attachments/assets/a0b1ba4c-c996-4702-a68e-8f4b10f90578" /><img width="1440" height="819" alt="image" src="https://github.com/user-attachments/assets/5c6601c9-99a9-4351-bb33-67aa51a2d0fa" /># Go Task Queue (Go + Redis)
 
 Production-style background job queue written in Go. Jobs are stored in Redis, processed by a worker pool with timeouts, retried with exponential backoff, and tracked with Prometheus/Grafana. A small Admin UI provides visibility into recent jobs and DLQ management.
 
