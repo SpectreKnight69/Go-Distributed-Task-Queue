@@ -95,9 +95,13 @@ func main() {
 		}
 	})
 
-	// Create an HTTP server
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"  // fallback for local
+	}
+
 	server := &http.Server{
-		Addr:    ":8080",
+		Addr:    ":" + port,
 		Handler: mux,
 	}
 
