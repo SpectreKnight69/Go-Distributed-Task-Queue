@@ -136,9 +136,9 @@ func (rq *RedisQueue) StartDelayedJobPoller() {
 	}()
 }
 
-func (rq *RedisQueue) SetJobStatus(jobID int64, status string) {
+func (rq *RedisQueue) SetJobStatus(jobID int64, status string) error {
 	key := fmt.Sprintf("job_status:%d", jobID)
-	rq.client.Set(rq.ctx, key, status, 0)
+	return rq.client.Set(rq.ctx, key, status, 0).Err()
 }
 
 func (rq *RedisQueue) GetJobStatus(jobID int64) (string, error) {

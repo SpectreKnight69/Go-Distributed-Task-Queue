@@ -19,7 +19,7 @@ import (
 )
 
 func main() {
-	q := queue.NewQueue(10)
+	q := queue.NewQueue()
 	redisQueue := queue.NewRedisQueue()
 	redisQueue.StartDelayedJobPoller()
 
@@ -37,16 +37,7 @@ func main() {
 	mux.Handle("/metrics", promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))
 
 	// Enqueue new jobs
-	mux.HandleFunc("/enqueue", func(w http.ResponseWriter, r *http.Request) {
-		name := r.URL.Query().Get("name")
-		if name == "" {
-			name = "Generic Job"
-		}
-		job := q.Enqueue(name)
-		redisQueue.Enqueue(job)
-		redisQueue.SetJobStatus(job.ID, "QUEUED")
-		fmt.Fprintf(w, "Job %d enqueued successfully\n", job.ID)
-	})
+	mux.Handle("/enqueue", newEnqueueHandler(q.Enqueue, redisQueue))
 
 	// Get job status
 	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
@@ -97,7 +88,7 @@ func main() {
 
 	port := os.Getenv("PORT")
 	if port == "" {
-		port = "8080"  // fallback for local
+		port = "8080" // fallback for local
 	}
 
 	server := &http.Server{
@@ -133,4 +124,29 @@ func main() {
 	q.WaitForOngoingJobs()
 
 	fmt.Println("✅ Server exited cleanly.")
+}
+
+type enqueueStore interface {
+	Enqueue(queue.Job) error
+	SetJobStatus(jobID int64, status string) error
+}
+
+func newEnqueueHandler(createJob func(string) queue.Job, store enqueueStore) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := r.URL.Query().Get("name")
+		if name == "" {
+			name = "Generic Job"
+		}
+
+		job := createJob(name)
+		if err := store.Enqueue(job); err != nil {
+			http.Error(w, "failed to enqueue job", http.StatusInternalServerError)
+			return
+		}
+
+		if err := store.SetJobStatus(job.ID, "QUEUED"); err != nil {
+			log.Printf("failed to set QUEUED status for job %d: %v", job.ID, err)
+		}
+		fmt.Fprintf(w, "Job %d enqueued successfully\n", job.ID)
+	}
 }
