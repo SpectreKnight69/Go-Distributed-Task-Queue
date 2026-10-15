@@ -2,6 +2,7 @@ package queue
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -20,25 +21,32 @@ type Job struct {
 	EndedAt   time.Time `json:"ended_at"`
 }
 
+const maxRetryCount = 3
+
+// retryBackoff returns the delay for a scheduled retry. Retry counts outside
+// the queue's supported range do not have a retry delay.
+func retryBackoff(retryCount int) time.Duration {
+	if retryCount < 1 || retryCount > maxRetryCount {
+		return 0
+	}
+	return time.Duration(5*(1<<retryCount)) * time.Second
+}
+
 type Queue struct {
-	JobChannel    chan Job
 	counter       int64
 	totalDuration float64
 	totalJobs     int
 	wg            sync.WaitGroup
 }
 
-func NewQueue(bufferCapacity int) *Queue {
+func NewQueue() *Queue {
 	rand.Seed(time.Now().UnixNano())
-	return &Queue{
-		JobChannel: make(chan Job, bufferCapacity),
-	}
+	return &Queue{}
 }
 
 func (q *Queue) Enqueue(name string) Job {
 	id := atomic.AddInt64(&q.counter, 1)
-	job := Job{ID: id, Name: name, MaxRetry: 3}
-	q.JobChannel <- job
+	job := Job{ID: id, Name: name, MaxRetry: maxRetryCount}
 	fmt.Printf("✅ Enqueued job #%d: %s\n", job.ID, job.Name)
 	metrics.JobsEnqueued.Inc()
 	return job
@@ -60,7 +68,9 @@ func (q *Queue) StartWorkerWithRedis(workerID int, rq *RedisQueue) {
 
 				job.Status = "PROCESSING"
 				job.StartedAt = time.Now()
-				rq.SetJobStatus(job.ID, "PROCESSING")
+				if err := rq.SetJobStatus(job.ID, "PROCESSING"); err != nil {
+					log.Printf("worker %d: failed to set PROCESSING status for job %d: %v", workerID, job.ID, err)
+				}
 				rq.SaveJob(job)
 
 				fmt.Printf("👷 Worker %d started job #%d (%s)\n", workerID, job.ID, job.Name)
@@ -70,22 +80,28 @@ func (q *Queue) StartWorkerWithRedis(workerID int, rq *RedisQueue) {
 				if success {
 					job.Status = "SUCCESS"
 					job.EndedAt = time.Now()
-					rq.SetJobStatus(job.ID, "SUCCESS")
+					if err := rq.SetJobStatus(job.ID, "SUCCESS"); err != nil {
+						log.Printf("worker %d: failed to set SUCCESS status for job %d: %v", workerID, job.ID, err)
+					}
 					rq.SaveJob(job)
 					metrics.JobsCompleted.Inc()
 				} else if job.Retries < job.MaxRetry {
 					job.Retries++
-					backoff := time.Duration(5*(1<<job.Retries)) * time.Second // Exponential backoff
+					backoff := retryBackoff(job.Retries)
 					rq.EnqueueWithDelay(job, backoff)
 					job.Status = "RETRYING"
-					rq.SetJobStatus(job.ID, "RETRYING")
+					if err := rq.SetJobStatus(job.ID, "RETRYING"); err != nil {
+						log.Printf("worker %d: failed to set RETRYING status for job %d: %v", workerID, job.ID, err)
+					}
 					rq.SaveJob(job)
 					fmt.Printf("🔁 Retrying job #%d (retry %d) after %.0f seconds\n", job.ID, job.Retries, backoff.Seconds())
 				} else {
 					job.Status = "FAILED"
 					job.EndedAt = time.Now()
 					rq.MoveToDLQ(job)
-					rq.SetJobStatus(job.ID, "FAILED")
+					if err := rq.SetJobStatus(job.ID, "FAILED"); err != nil {
+						log.Printf("worker %d: failed to set FAILED status for job %d: %v", workerID, job.ID, err)
+					}
 					rq.SaveJob(job)
 					metrics.JobsFailed.Inc()
 				}
@@ -93,7 +109,6 @@ func (q *Queue) StartWorkerWithRedis(workerID int, rq *RedisQueue) {
 		}
 	}()
 }
-
 
 func (q *Queue) processJobWithTimeout(workerID int, job Job, timeout time.Duration) bool {
 	start := time.Now() // start timer
